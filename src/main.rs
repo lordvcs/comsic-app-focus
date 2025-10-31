@@ -1,7 +1,6 @@
-mod focus;
-
 use anyhow::Result;
 use clap::Parser;
+use cosmic_app_focus::focus;
 
 /// Launch or focus an application by app-id / desktop-id (ex: org.mozilla.firefox or firefox)
 #[derive(Parser, Debug)]

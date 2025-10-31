@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeSet;
+
 use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_handle_v1::{Event as CosmicHandleEvent, ZcosmicToplevelHandleV1},
     zcosmic_toplevel_info_v1::{
@@ -431,4 +433,52 @@ pub fn focus_or_launch(app_id: &str, launch_cmd: Option<&str>) -> Result<()> {
         return Err(anyhow!("launcher exited with {}", status));
     }
     Ok(())
+}
+
+pub fn list_running_apps() -> Result<Vec<String>> {
+    let conn = Connection::connect_to_env().context("connect to Wayland")?;
+    let (globals, mut event_queue) = registry_queue_init::<State>(&conn)?;
+    let qh = event_queue.handle();
+
+    let mut state = State::new(String::new());
+
+    if let Ok(seat) = globals.bind::<wl_seat::WlSeat, _, _>(&qh, 1..=8, ()) {
+        state.seat = Some(seat);
+    }
+
+    state.info = Some(
+        globals
+            .bind::<CosmicToplevelInfo, _, _>(&qh, 1..=3, ())
+            .context("bind cosmic_toplevel_info")?,
+    );
+
+    state.mgr = globals
+        .bind::<CosmicToplevelManager, _, _>(&qh, 1..=4, ())
+        .ok();
+
+    state.foreign_list = globals
+        .bind::<ForeignToplevelList, _, _>(&qh, 1..=1, ())
+        .ok();
+
+    for _ in 0..5 {
+        event_queue
+            .roundtrip(&mut state)
+            .context("process wayland events")?;
+    }
+
+    let _ = event_queue.dispatch_pending(&mut state);
+
+    let mut seen = BTreeSet::new();
+    let mut apps = Vec::new();
+    for tracked in state.toplevels.iter() {
+        if let Some(app_id) = tracked.app_id.as_ref() {
+            let key = app_id.to_lowercase();
+            if seen.insert(key) {
+                apps.push(app_id.clone());
+            }
+        }
+    }
+
+    apps.sort();
+    Ok(apps)
 }

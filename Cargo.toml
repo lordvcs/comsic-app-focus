@@ -3,6 +3,14 @@ name = "cosmic-app-focus"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "cosmic-app-focus"
+path = "src/main.rs"
+
+[[bin]]
+name = "cosmic-app-focus-applet"
+path = "src/bin/cosmic_app_focus_applet.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.51", features = ["derive"] }
@@ -13,3 +21,17 @@ zbus = "5.12.0"
 wayland-protocols = { version = "0.32.9", features = ["client", "unstable"] }
 log = "0.4.22"
 env_logger = "0.11.5"
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "winit",
+    "desktop-systemd-scope",
+    "dbus-config",
+] }
+cosmic-config = { git = "https://github.com/pop-os/libcosmic" }
+cosmic-config-derive = { git = "https://github.com/pop-os/libcosmic" }
+serde = { version = "1.0.228", features = ["derive"] }
+rustc-hash = "2.1.0"
