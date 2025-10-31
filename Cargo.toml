@@ -1,0 +1,15 @@
+[package]
+name = "cosmic-app-focus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.51", features = ["derive"] }
+wayland-client = "0.31.11"
+smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["calloop"] }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", features = ["client"] }
+zbus = "5.12.0"
+wayland-protocols = { version = "0.32.9", features = ["client", "unstable"] }
+log = "0.4.22"
+env_logger = "0.11.5"
