@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=COSMIC App Focus
+Comment=Focus pinned apps or launch them via COSMIC panel
+Exec=cosmic-app-focus-applet
+Terminal=false
+Type=Application
+Categories=COSMIC;
+NoDisplay=true
+Icon=com.system76.CosmicAppFocusApplet
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=50

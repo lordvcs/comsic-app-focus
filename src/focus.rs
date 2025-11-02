@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::mpsc::Sender};
 
 use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_handle_v1::{Event as CosmicHandleEvent, ZcosmicToplevelHandleV1},
@@ -141,6 +141,42 @@ impl State {
     }
 }
 
+struct AppTrackerState {
+    seat: Option<wl_seat::WlSeat>,
+    info: Option<CosmicToplevelInfo>,
+    mgr: Option<CosmicToplevelManager>,
+    foreign_list: Option<ForeignToplevelList>,
+    toplevels: Vec<TrackedToplevel>,
+    sender: Sender<Vec<String>>,
+}
+
+impl AppTrackerState {
+    fn new(sender: Sender<Vec<String>>) -> Self {
+        Self {
+            seat: None,
+            info: None,
+            mgr: None,
+            foreign_list: None,
+            toplevels: Vec::new(),
+            sender,
+        }
+    }
+
+    fn broadcast(&self) {
+        let mut seen = BTreeSet::new();
+        let mut apps = Vec::new();
+        for tracked in &self.toplevels {
+            if let Some(app_id) = tracked.app_id.as_ref() {
+                let key = app_id.to_lowercase();
+                if seen.insert(key) {
+                    apps.push(app_id.clone());
+                }
+            }
+        }
+        let _ = self.sender.send(apps);
+    }
+}
+
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
         _state: &mut Self,
@@ -153,7 +189,34 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     }
 }
 
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppTrackerState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        _event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if state.seat.is_none() {
+            state.seat = Some(seat.clone());
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for AppTrackerState {
     fn event(
         state: &mut Self,
         seat: &wl_seat::WlSeat,
@@ -213,6 +276,51 @@ impl Dispatch<ForeignToplevelList, ()> for State {
     );
 }
 
+impl Dispatch<ForeignToplevelList, ()> for AppTrackerState {
+    fn event(
+        state: &mut Self,
+        _list: &ForeignToplevelList,
+        event: ForeignListEvent,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ForeignListEvent::Toplevel { toplevel } => {
+                let cosmic_handle = state.info.as_ref().and_then(|info| {
+                    if info.version() >= 2 {
+                        Some(info.get_cosmic_toplevel(&toplevel, qh, ()))
+                    } else {
+                        None
+                    }
+                });
+                let cosmic_id = cosmic_handle.as_ref().map(|handle| handle.id());
+                log::trace!(
+                    "[applet] foreign toplevel {} announced (cosmic handle {:?})",
+                    toplevel.id(),
+                    cosmic_id
+                );
+
+                state.toplevels.push(TrackedToplevel {
+                    foreign: Some(toplevel.clone()),
+                    cosmic: cosmic_handle,
+                    app_id: None,
+                });
+            }
+            ForeignListEvent::Finished => {}
+            _ => {}
+        }
+    }
+
+    event_created_child!(
+        AppTrackerState,
+        ForeignToplevelList,
+        [
+            FOREIGN_TOPLEVEL_OPCODE => (ForeignToplevelHandle, ())
+        ]
+    );
+}
+
 impl Dispatch<ForeignToplevelHandle, ()> for State {
     fn event(
         state: &mut Self,
@@ -241,6 +349,43 @@ impl Dispatch<ForeignToplevelHandle, ()> for State {
             }
             ForeignToplevelEvent::Closed => {
                 state.remove_by_foreign(toplevel);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ForeignToplevelHandle, ()> for AppTrackerState {
+    fn event(
+        state: &mut Self,
+        toplevel: &ForeignToplevelHandle,
+        event: ForeignToplevelEvent,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ForeignToplevelEvent::AppId { app_id } => {
+                if let Some(idx) = state
+                    .toplevels
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, tracked)| tracked.matches_foreign(toplevel).then_some(idx))
+                {
+                    state.toplevels[idx].app_id = Some(app_id.clone());
+                    state.broadcast();
+                }
+            }
+            ForeignToplevelEvent::Closed => {
+                let remove_id = toplevel.id();
+                state.toplevels.retain(|tracked| {
+                    tracked
+                        .foreign
+                        .as_ref()
+                        .map(|f| f.id() != remove_id)
+                        .unwrap_or(true)
+                });
+                state.broadcast();
             }
             _ => {}
         }
@@ -292,6 +437,50 @@ impl Dispatch<CosmicToplevelHandle, ()> for State {
     }
 }
 
+impl Dispatch<CosmicToplevelHandle, ()> for AppTrackerState {
+    fn event(
+        state: &mut Self,
+        handle: &CosmicToplevelHandle,
+        event: CosmicHandleEvent,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            CosmicHandleEvent::AppId { app_id } => {
+                if let Some(idx) = state
+                    .toplevels
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, tracked)| tracked.matches_cosmic(handle).then_some(idx))
+                {
+                    state.toplevels[idx].app_id = Some(app_id.clone());
+                    state.broadcast();
+                } else {
+                    state.toplevels.push(TrackedToplevel {
+                        foreign: None,
+                        cosmic: Some(handle.clone()),
+                        app_id: Some(app_id.clone()),
+                    });
+                    state.broadcast();
+                }
+            }
+            CosmicHandleEvent::Closed => {
+                let remove_id = handle.id();
+                state.toplevels.retain(|tracked| {
+                    tracked
+                        .cosmic
+                        .as_ref()
+                        .map(|c| c.id() != remove_id)
+                        .unwrap_or(true)
+                });
+                state.broadcast();
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<CosmicToplevelInfo, ()> for State {
     fn event(
         _state: &mut Self,
@@ -312,7 +501,39 @@ impl Dispatch<CosmicToplevelInfo, ()> for State {
     );
 }
 
+impl Dispatch<CosmicToplevelInfo, ()> for AppTrackerState {
+    fn event(
+        _: &mut Self,
+        _: &CosmicToplevelInfo,
+        _: CosmicInfoEvent,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    event_created_child!(
+        AppTrackerState,
+        CosmicToplevelInfo,
+        [
+            EVT_TOPLEVEL_OPCODE => (CosmicToplevelHandle, ())
+        ]
+    );
+}
+
 impl Dispatch<CosmicToplevelManager, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &CosmicToplevelManager,
+        _: <CosmicToplevelManager as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<CosmicToplevelManager, ()> for AppTrackerState {
     fn event(
         _: &mut Self,
         _: &CosmicToplevelManager,
@@ -481,4 +702,44 @@ pub fn list_running_apps() -> Result<Vec<String>> {
 
     apps.sort();
     Ok(apps)
+}
+
+pub fn watch_running_apps(sender: Sender<Vec<String>>) -> Result<()> {
+    let conn = Connection::connect_to_env().context("connect to Wayland")?;
+    let (globals, mut event_queue) = registry_queue_init::<AppTrackerState>(&conn)?;
+    let qh = event_queue.handle();
+
+    let mut state = AppTrackerState::new(sender);
+
+    if let Ok(seat) = globals.bind::<wl_seat::WlSeat, _, _>(&qh, 1..=8, ()) {
+        state.seat = Some(seat);
+    }
+
+    state.info = Some(
+        globals
+            .bind::<CosmicToplevelInfo, _, _>(&qh, 1..=3, ())
+            .context("bind cosmic_toplevel_info")?,
+    );
+
+    state.mgr = globals
+        .bind::<CosmicToplevelManager, _, _>(&qh, 1..=4, ())
+        .ok();
+
+    state.foreign_list = globals
+        .bind::<ForeignToplevelList, _, _>(&qh, 1..=1, ())
+        .ok();
+
+    for _ in 0..5 {
+        event_queue
+            .roundtrip(&mut state)
+            .context("warm up wayland events")?;
+    }
+
+    state.broadcast();
+
+    loop {
+        event_queue
+            .blocking_dispatch(&mut state)
+            .context("dispatch wayland events")?;
+    }
 }

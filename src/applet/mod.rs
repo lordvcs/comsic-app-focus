@@ -1,23 +1,30 @@
-mod config;
-
-use std::{borrow::Cow, collections::BTreeSet, time::Duration};
-
-use config::AppletConfig;
 use cosmic::{
     app,
     cosmic_config::{Config, CosmicConfigEntry},
     desktop::fde::{self, get_languages_from_env, DesktopEntry},
+    iced::futures::SinkExt,
     iced::{self, Alignment, Subscription},
     iced_widget::Row,
     surface,
     widget::container,
     Action, Element, Task,
 };
+mod config;
+use config::{AppListConfig, APP_LIST_ID};
+use cosmic_settings_config::shortcuts::{
+    Action as ShortcutAction, Binding, Config as ShortcutConfig,
+};
+use iced::stream;
 use rustc_hash::FxHashMap;
+use std::any::TypeId;
+use std::{borrow::Cow, collections::BTreeSet, str::FromStr, sync::mpsc, thread};
 
 use crate::focus;
 
 const APP_ID: &str = "com.system76.CosmicAppFocusApplet";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RunningAppsSubscription;
 
 #[derive(Debug, Clone)]
 struct AppButtonModel {
@@ -28,28 +35,28 @@ struct AppButtonModel {
 
 pub struct FocusApplet {
     core: cosmic::app::Core,
-    config: AppletConfig,
+    config: AppListConfig,
     running: Vec<String>,
     items: Vec<AppButtonModel>,
     locales: Vec<String>,
     desktop_entries: Vec<DesktopEntry>,
     desktop_cache: FxHashMap<String, DesktopEntry>,
+    shortcut_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Activate(String),
     AppsUpdated(Vec<String>),
-    RefreshTick,
-    ConfigUpdated(AppletConfig),
+    ConfigUpdated(AppListConfig),
     Surface(surface::Action),
 }
 
 impl FocusApplet {
-    fn load_config() -> AppletConfig {
-        Config::new(APP_ID, AppletConfig::VERSION)
+    fn load_config() -> AppListConfig {
+        Config::new(APP_LIST_ID, AppListConfig::VERSION)
             .ok()
-            .and_then(|cfg| AppletConfig::get_entry(&cfg).ok())
+            .and_then(|cfg| AppListConfig::get_entry(&cfg).ok())
             .unwrap_or_default()
     }
 
@@ -99,7 +106,7 @@ impl FocusApplet {
         let mut items = Vec::new();
         let mut seen = BTreeSet::new();
 
-        for app_id in self.config.pinned.clone() {
+        for app_id in self.config.favorites.clone() {
             if let Some(item) = self.entry_metadata(&app_id) {
                 let key = item.app_id.to_lowercase();
                 if seen.insert(key) {
@@ -114,7 +121,7 @@ impl FocusApplet {
             .filter(|app| {
                 !self
                     .config
-                    .pinned
+                    .favorites
                     .iter()
                     .any(|p| p.eq_ignore_ascii_case(app))
             })
@@ -175,6 +182,27 @@ impl FocusApplet {
             )
             .into()
     }
+
+    fn update_shortcut_bindings(&mut self) {
+        let targets: Vec<String> = self
+            .config
+            .favorites
+            .iter()
+            .filter(|id| !id.is_empty())
+            .take(10)
+            .cloned()
+            .collect();
+
+        if targets == self.shortcut_targets {
+            return;
+        }
+
+        if let Err(err) = apply_super_shortcuts(&targets) {
+            log::error!("Failed to update Super+number shortcuts: {err}");
+        } else {
+            self.shortcut_targets = targets;
+        }
+    }
 }
 
 impl cosmic::Application for FocusApplet {
@@ -192,22 +220,20 @@ impl cosmic::Application for FocusApplet {
             locales: get_languages_from_env(),
             desktop_entries: Vec::new(),
             desktop_cache: FxHashMap::default(),
+            shortcut_targets: Vec::new(),
         };
         applet.update_desktop_entries();
         applet.rebuild_items();
-        let task = Task::perform(
-            async {
-                match focus::list_running_apps() {
-                    Ok(apps) => apps,
-                    Err(err) => {
-                        log::error!("Failed to list running apps: {err}");
-                        Vec::new()
-                    }
-                }
-            },
-            |apps| Action::App(Message::AppsUpdated(apps)),
-        );
-        (applet, task)
+        applet.running = match focus::list_running_apps() {
+            Ok(apps) => apps,
+            Err(err) => {
+                log::error!("Failed to list running apps: {err}");
+                Vec::new()
+            }
+        };
+        applet.rebuild_items();
+        applet.update_shortcut_bindings();
+        (applet, Task::none())
     }
 
     fn core(&self) -> &cosmic::app::Core {
@@ -233,23 +259,13 @@ impl cosmic::Application for FocusApplet {
             Message::AppsUpdated(apps) => {
                 self.running = apps;
                 self.rebuild_items();
+                self.update_shortcut_bindings();
                 Task::none()
             }
-            Message::RefreshTick => Task::perform(
-                async {
-                    match focus::list_running_apps() {
-                        Ok(apps) => apps,
-                        Err(err) => {
-                            log::error!("Failed to list running apps: {err}");
-                            Vec::new()
-                        }
-                    }
-                },
-                |apps| Action::App(Message::AppsUpdated(apps)),
-            ),
             Message::ConfigUpdated(config) => {
                 self.config = config;
                 self.rebuild_items();
+                self.update_shortcut_bindings();
                 Task::none()
             }
             Message::Surface(action) => {
@@ -259,14 +275,13 @@ impl cosmic::Application for FocusApplet {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let tick = iced::time::every(Duration::from_secs(4)).map(|_| Message::RefreshTick);
-        let config = self.core.watch_config(APP_ID).map(|update| {
+        let config = self.core.watch_config(APP_LIST_ID).map(|update| {
             for err in update.errors {
                 log::warn!("Config watch error: {err}");
             }
             Message::ConfigUpdated(update.config)
         });
-        Subscription::batch(vec![tick, config])
+        Subscription::batch(vec![running_apps_subscription(), config])
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -283,4 +298,57 @@ impl cosmic::Application for FocusApplet {
 pub fn run() -> cosmic::iced::Result {
     focus::init_logger(0);
     cosmic::applet::run::<FocusApplet>(())
+}
+
+fn running_apps_subscription() -> Subscription<Message> {
+    Subscription::run_with_id(
+        TypeId::of::<RunningAppsSubscription>(),
+        stream::channel(16, |mut output| async move {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                if let Err(err) = focus::watch_running_apps(tx) {
+                    log::error!("Wayland watcher exited: {err}");
+                }
+            });
+
+            while let Ok(apps) = rx.recv() {
+                if output.send(Message::AppsUpdated(apps)).await.is_err() {
+                    break;
+                }
+            }
+        }),
+    )
+}
+
+fn apply_super_shortcuts(targets: &[String]) -> anyhow::Result<()> {
+    let context = ShortcutConfig::context()?;
+    let mut entry = ShortcutConfig::get_entry(&context).unwrap_or_default();
+
+    for idx in 0..10 {
+        let key = if idx == 9 {
+            "Super+0".to_string()
+        } else {
+            format!("Super+{}", idx + 1)
+        };
+        if let Ok(binding) = Binding::from_str(&key) {
+            entry.custom.0.remove(&binding);
+        }
+    }
+
+    for (idx, app_id) in targets.iter().enumerate().take(10) {
+        let key = if idx == 9 {
+            "Super+0".to_string()
+        } else {
+            format!("Super+{}", idx + 1)
+        };
+        let binding = Binding::from_str(&key)
+            .map_err(|err| anyhow::anyhow!("invalid binding {}: {}", key, err))?;
+        entry.custom.0.insert(
+            binding,
+            ShortcutAction::Spawn(format!("cosmic-app-focus {}", app_id)),
+        );
+    }
+
+    entry.write_entry(&context)?;
+    Ok(())
 }

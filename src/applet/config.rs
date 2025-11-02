@@ -1,16 +1,32 @@
-use cosmic_config::{cosmic_config_derive::CosmicConfigEntry, CosmicConfigEntry};
+use cosmic::cosmic_config::cosmic_config_derive::CosmicConfigEntry;
+use cosmic::cosmic_config::CosmicConfigEntry;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, CosmicConfigEntry)]
-#[version = 1]
+pub const APP_LIST_ID: &str = "com.system76.CosmicAppList";
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AppletConfig {
-    #[serde(default)]
-    pub pinned: Vec<String>,
+pub enum TopLevelFilter {
+    #[default]
+    ActiveWorkspace,
+    ConfiguredOutput,
 }
 
-impl Default for AppletConfig {
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, CosmicConfigEntry)]
+#[version = 1]
+#[serde(deny_unknown_fields)]
+pub struct AppListConfig {
+    pub filter_top_levels: Option<TopLevelFilter>,
+    pub favorites: Vec<String>,
+    pub enable_drag_source: bool,
+}
+
+impl Default for AppListConfig {
     fn default() -> Self {
-        Self { pinned: Vec::new() }
+        Self {
+            filter_top_levels: None,
+            favorites: Vec::new(),
+            enable_drag_source: true,
+        }
     }
 }

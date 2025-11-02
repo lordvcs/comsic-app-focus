@@ -1079,6 +1079,7 @@ dependencies = [
  "cosmic-config",
  "cosmic-config-derive",
  "cosmic-protocols 0.1.0 (git+https://github.com/pop-os/cosmic-protocols)",
+ "cosmic-settings-config",
  "env_logger",
  "libcosmic",
  "log",
